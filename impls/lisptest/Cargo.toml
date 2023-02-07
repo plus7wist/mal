@@ -5,4 +5,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.69"
+lazy_static = "1.4.0"
+regex = "1.7.1"
 rustyline = "10.1.1"
