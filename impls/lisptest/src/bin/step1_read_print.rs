@@ -51,45 +51,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-impl std::fmt::Display for Data {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
-        use Data::*;
-
-        match &self {
-            Nil => write!(f, "nil")?,
-            Bool(b) => write!(f, "{}", b)?,
-
-            List(l) => {
-                write!(f, "(")?;
-
-                let mut first = true;
-                for each in l {
-                    if first {
-                        first = false;
-                    } else {
-                        write!(f, " ")?;
-                    }
-
-                    write!(f, "{}", each)?;
-                }
-
-                write!(f, ")")?;
-            }
-
-            Str(s) => write!(f, "{:?}", s)?,
-            I64(n) => write!(f, "{}", n)?,
-            Sym(s) => write!(f, "{}", s)?,
-
-            Quote(x) => write!(f, "(quote {})", x)?,
-            QuasiQuote(x) => write!(f, "(quasiquote {})", x)?,
-            Unquote(x) => write!(f, "(unquote {})", x)?,
-            SpliceUnqute(x) => write!(f, "(splice-unqute {})", x)?,
-        }
-
-        Ok(())
-    }
-}
-
 fn read_str(text: &str) -> Result<Data> {
     let tokens = tokenize(text);
 
@@ -115,7 +76,10 @@ fn tokenize(text: &str) -> Vec<String> {
 enum Data {
     Nil,
     Bool(bool),
-    List(Vec<Data>),
+    List {
+        pair: (char, char),
+        elements: Vec<Data>,
+    },
     Str(String),
     I64(i64),
     Sym(String),
@@ -123,6 +87,48 @@ enum Data {
     QuasiQuote(Box<Data>),
     Unquote(Box<Data>),
     SpliceUnqute(Box<Data>),
+}
+
+impl std::fmt::Display for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        use Data::*;
+
+        match &self {
+            Nil => write!(f, "nil")?,
+            Bool(b) => write!(f, "{}", b)?,
+
+            List {
+                pair: (open, close),
+                elements: l,
+            } => {
+                write!(f, "{}", open)?;
+
+                let mut first = true;
+                for each in l {
+                    if first {
+                        first = false;
+                    } else {
+                        write!(f, " ")?;
+                    }
+
+                    write!(f, "{}", each)?;
+                }
+
+                write!(f, "{}", close)?;
+            }
+
+            Str(s) => write!(f, "{:?}", s)?,
+            I64(n) => write!(f, "{}", n)?,
+            Sym(s) => write!(f, "{}", s)?,
+
+            Quote(x) => write!(f, "(quote {})", x)?,
+            QuasiQuote(x) => write!(f, "(quasiquote {})", x)?,
+            Unquote(x) => write!(f, "(unquote {})", x)?,
+            SpliceUnqute(x) => write!(f, "(splice-unqute {})", x)?,
+        }
+
+        Ok(())
+    }
 }
 
 #[test]
@@ -143,19 +149,27 @@ fn read_list<'s, I>(mut tokens: std::iter::Peekable<I>) -> Result<(std::iter::Pe
 where
     I: std::iter::Iterator<Item = &'s String>,
 {
-    let close = match tokens.next().map(String::as_str) {
-        Some("(") => ")",
-        Some("[") => "]",
-        Some("{") => "}",
+    let open = tokens.next().unwrap().chars().next().unwrap();
+
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
         token => panic!("invalid token: {:?}", token),
     };
 
     let mut list = vec![];
 
     while let Some(token) = tokens.peek() {
-        if *token == close {
+        if token.chars().next() == Some(close) {
             let _ = tokens.next();
-            return Ok((tokens, Data::List(list)));
+            return Ok((
+                tokens,
+                Data::List {
+                    pair: (open, close),
+                    elements: list,
+                },
+            ));
         }
 
         let (rest_token, data) = read_form(tokens)?;
