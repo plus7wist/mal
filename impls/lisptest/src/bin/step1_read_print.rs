@@ -7,6 +7,9 @@ use lazy_static::lazy_static;
 
 use regex::Regex;
 
+#[macro_use]
+extern crate log;
+
 /*
 enum Token {
     Spec1(char), // []{}()'`~^@
@@ -15,6 +18,8 @@ enum Token {
 */
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let mut ed = Editor::<()>::new()?;
 
     loop {
@@ -40,53 +45,55 @@ fn main() -> Result<()> {
             }
         };
 
-        println_data(&data);
+        println!("{}", data);
     }
 
     Ok(())
 }
 
-fn println_data(data: &Data) {
-    print_data(&data);
-    println!();
-}
+impl std::fmt::Display for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        use Data::*;
 
-fn print_data(data: &Data) {
-    use Data::*;
+        match &self {
+            Nil => write!(f, "nil")?,
+            Bool(b) => write!(f, "{}", b)?,
 
-    match &data {
-        Nil => print!("nil"),
-        Bool(b) => print!("{}", b),
-        List(l) => {
-            print!("(");
+            List(l) => {
+                write!(f, "(")?;
 
-            let mut first = true;
-            for each in l {
-                if first {
-                    first = false;
-                } else {
-                    print!(" ");
+                let mut first = true;
+                for each in l {
+                    if first {
+                        first = false;
+                    } else {
+                        write!(f, " ")?;
+                    }
+
+                    write!(f, "{}", each)?;
                 }
 
-                print_data(&each);
+                write!(f, ")")?;
             }
 
-            print!(")");
+            Str(s) => write!(f, "{:?}", s)?,
+            I64(n) => write!(f, "{}", n)?,
+            Sym(s) => write!(f, "{}", s)?,
+
+            Quote(x) => write!(f, "(quote {})", x)?,
+            QuasiQuote(x) => write!(f, "(quasiquote {})", x)?,
+            Unquote(x) => write!(f, "(unquote {})", x)?,
+            SpliceUnqute(x) => write!(f, "(splice-unqute {})", x)?,
         }
-        Str(s) => {
-            print!("\"{}\"", s);
-        }
-        I64(n) => {
-            print!("{}", n);
-        }
-        Sym(s) => {
-            print!("{}", s);
-        }
+
+        Ok(())
     }
 }
 
 fn read_str(text: &str) -> Result<Data> {
     let tokens = tokenize(text);
+
+    debug!("tokens: {:?}", tokens);
 
     let (_, data) = read_form(tokens.iter().peekable())?;
 
@@ -104,7 +111,7 @@ fn tokenize(text: &str) -> Vec<String> {
     RE.captures_iter(text).map(|x| x[1].to_string()).collect()
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum Data {
     Nil,
     Bool(bool),
@@ -112,6 +119,10 @@ enum Data {
     Str(String),
     I64(i64),
     Sym(String),
+    Quote(Box<Data>),
+    QuasiQuote(Box<Data>),
+    Unquote(Box<Data>),
+    SpliceUnqute(Box<Data>),
 }
 
 #[test]
@@ -157,6 +168,43 @@ where
     anyhow::bail!("reach EOF before close list")
 }
 
+/// 将输入的字符串字面值转换成转义后的字符串。
+fn escape_str(text: &str) -> Result<String> {
+    let mut s = vec![];
+
+    let mut escape = false;
+    let mut end = false;
+
+    for c in text.chars().skip(1) {
+        if escape {
+            s.push(escape_char(c));
+            escape = false;
+            continue;
+        }
+
+        match c {
+            '"' => end = true,
+            '\\' => escape = true,
+            _ => s.push(c),
+        }
+    }
+
+    if !end {
+        anyhow::bail!("unbalanced string: reach token end before close");
+    }
+
+    Ok(s.into_iter().collect())
+}
+
+fn escape_char(c: char) -> char {
+    match c {
+        'n' => '\n',
+        't' => '\t',
+        'r' => '\r',
+        _ => c,
+    }
+}
+
 fn read_atom<'s, I>(mut tokens: std::iter::Peekable<I>) -> Result<(std::iter::Peekable<I>, Data)>
 where
     I: std::iter::Iterator<Item = &'s String>,
@@ -165,14 +213,8 @@ where
         "true" => Data::Bool(true),
         "false" => Data::Bool(false),
         "nil" => Data::Nil,
-        token if token.starts_with('"') => Data::Str(
-            token
-                .strip_prefix('"')
-                .unwrap()
-                .strip_suffix('"')
-                .context("unbalanced string: reach token end before close")?
-                .to_string(),
-        ),
+
+        token if token.starts_with('"') => Data::Str(escape_str(token)?),
         token => {
             if let Ok(n) = token.parse::<i64>() {
                 Data::I64(n)
@@ -185,14 +227,42 @@ where
     Ok((tokens, data))
 }
 
-fn read_form<'s, I>(mut tokens: std::iter::Peekable<I>) -> Result<(std::iter::Peekable<I>, Data)>
+type ParseOk<I> = (std::iter::Peekable<I>, Data);
+
+type ParseResult<I> = Result<ParseOk<I>>;
+
+fn read_form<'s, I>(mut tokens: std::iter::Peekable<I>) -> ParseResult<I>
 where
     I: std::iter::Iterator<Item = &'s String>,
 {
     let token = tokens.peek().unwrap();
 
-    match token.chars().next().unwrap() {
-        '(' | '[' | '{' => read_list(tokens),
+    match token.as_str() {
+        "(" | "[" | "{" => read_list(tokens),
+
+        "'" => {
+            let _ = tokens.next();
+            let (tokens, data) = read_form(tokens)?;
+            Ok((tokens, Data::Quote(Box::new(data))))
+        }
+
+        "`" => {
+            let _ = tokens.next();
+            let (tokens, data) = read_form(tokens)?;
+            Ok((tokens, Data::QuasiQuote(Box::new(data))))
+        }
+
+        "~" => {
+            let _ = tokens.next();
+            let (tokens, data) = read_form(tokens)?;
+            Ok((tokens, Data::Unquote(Box::new(data))))
+        }
+
+        "~@" => {
+            let _ = tokens.next();
+            let (tokens, data) = read_form(tokens)?;
+            Ok((tokens, Data::SpliceUnqute(Box::new(data))))
+        }
         _ => read_atom(tokens),
     }
 }
