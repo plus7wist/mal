@@ -7,6 +7,7 @@ use lazy_static::lazy_static;
 
 use regex::Regex;
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -87,55 +88,136 @@ impl LispFn for LispDiv {
 }
 
 struct Env {
-    envmap: HashMap<String, Data>,
+    envmap: HashMap<String, Rc<Data>>,
+    prev: Option<Rc<RefCell<Env>>>,
 }
 
 impl Env {
-    fn new() -> Self {
-        let mut envmap: HashMap<String, _> = HashMap::new();
-
-        envmap.insert("+".to_string(), Data::Fn(Rc::new(LispAdd)));
-        envmap.insert("*".to_string(), Data::Fn(Rc::new(LispMul)));
-        envmap.insert("-".to_string(), Data::Fn(Rc::new(LispSub)));
-        envmap.insert("/".to_string(), Data::Fn(Rc::new(LispDiv)));
-
-        Self { envmap }
+    fn new() -> Rc<RefCell<Self>> {
+        Self::with_prev_option(None)
     }
 
-    fn lookup(&self, name: &str) -> Result<&Data> {
-        self.envmap
-            .get(name)
-            .ok_or_else(|| anyhow::format_err!("failed to lookup: {}", name))
+    fn with_prev(prev: Rc<RefCell<Self>>) -> Rc<RefCell<Self>> {
+        Self::with_prev_option(Some(prev))
+    }
+
+    fn with_prev_option(prev: Option<Rc<RefCell<Self>>>) -> Rc<RefCell<Self>> {
+        let mut envmap: HashMap<String, _> = HashMap::new();
+
+        envmap.insert("+".to_string(), Rc::new(Data::Fn(Rc::new(LispAdd))));
+        envmap.insert("*".to_string(), Rc::new(Data::Fn(Rc::new(LispMul))));
+        envmap.insert("-".to_string(), Rc::new(Data::Fn(Rc::new(LispSub))));
+        envmap.insert("/".to_string(), Rc::new(Data::Fn(Rc::new(LispDiv))));
+
+        Rc::new(RefCell::new(Self { envmap, prev }))
+    }
+
+    fn lookup_option(&self, name: &str) -> Option<Rc<Data>> {
+        self.envmap.get(name).cloned().or_else(|| {
+            self.prev
+                .as_ref()
+                .and_then(|env| env.borrow().lookup_option(name))
+        })
+    }
+
+    fn lookup(&self, name: &str) -> Result<Rc<Data>> {
+        self.lookup_option(name)
+            .ok_or_else(|| anyhow::format_err!("variable {} not found.", name))
     }
 }
 
-fn eval<'env>(form: &'env Data, env: &'env Env) -> Result<Data> {
+fn eval(form: &Data, env: Rc<RefCell<Env>>) -> Result<Data> {
     use Data::*;
 
     Ok(match form {
-        Var(s) => env.lookup(s)?.clone(),
+        Var(s) => Data::clone(env.borrow().lookup(s)?.as_ref()),
+
         List(elements) => {
-            // A empty list.
-            if elements.is_empty() {
-                return Ok(form.clone());
-            }
+            match &elements[..] {
+                // Empty list
+                [] => return Ok(form.clone()),
 
-            let func = eval(&elements[0], env)?;
-            let args: Vec<_> = elements
-                .iter()
-                .skip(1)
-                .map(|x| eval(x, env))
-                .collect::<Result<Vec<_>>>()?;
+                // Bind variable.
+                //
+                // def! name VALUE
+                //
+                [Data::Var(leading), Data::Var(v), form] if leading == "def!" => {
+                    let result = eval(form, env.clone())?;
 
-            match func {
-                Fn(func) => func.apply(&args)?,
-                _ => anyhow::bail!("first argument of function call is not function: {}", func),
+                    env.borrow_mut()
+                        .envmap
+                        .insert(v.clone(), result.clone().into());
+
+                    result
+                }
+
+                // Local bind.
+                //
+                [Data::Var(leading), Data::Ary(binds), form] if leading == "let*" => {
+                    let newenv = Env::with_prev(env);
+
+                    for each in binds.chunks(2) {
+                        match each {
+                            [Data::Var(name), value] => {
+                                let value = eval(value, newenv.clone())?;
+
+                                newenv
+                                    .borrow_mut()
+                                    .envmap
+                                    .insert(name.clone(), value.into());
+                            }
+                            _ => anyhow::bail!("invalid form: {}", form),
+                        }
+                    }
+
+                    eval(form, newenv)?
+                }
+
+                [Data::Var(leading), Data::List(binds), form] if leading == "let*" => {
+                    let newenv = Env::with_prev(env);
+
+                    for each in binds.chunks(2) {
+                        match each {
+                            [Data::Var(name), value] => {
+                                let value = eval(value, newenv.clone())?;
+
+                                newenv
+                                    .borrow_mut()
+                                    .envmap
+                                    .insert(name.clone(), value.into());
+                            }
+                            _ => anyhow::bail!("invalid form: {}", form),
+                        }
+                    }
+
+                    eval(form, newenv)?
+                }
+
+                // Function call.
+                //
+                // (FUNC ARG1 ARG2)
+                [func, args @ ..] => {
+                    let func = eval(func, env.clone())?;
+
+                    let args: Vec<_> = args
+                        .iter()
+                        .map(|x| eval(x, env.clone()))
+                        .collect::<Result<Vec<_>>>()?;
+
+                    match func {
+                        Fn(func) => func.apply(&args)?,
+                        _ => anyhow::bail!(
+                            "first argument of function call is not function: {}",
+                            func
+                        ),
+                    }
+                }
             }
         }
         Ary(elements) => Data::AryVal(
             elements
                 .iter()
-                .map(|x| eval(x, env))
+                .map(|x| eval(x, env.clone()))
                 .collect::<Result<Vec<_>>>()?,
         ),
         Map(elements) => {
@@ -145,7 +227,7 @@ fn eval<'env>(form: &'env Data, env: &'env Env) -> Result<Data> {
             let mut value = None;
 
             for each in elements.iter() {
-                let each = eval(each, env)?;
+                let each = eval(each, env.clone())?;
 
                 (key, value) = match (key, value) {
                     (None, None) => (Some(each.data_hash_key()?), None),
@@ -199,7 +281,7 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let data = match read_str(&l).and_then(|form| eval(&form, &env)) {
+        let data = match read_str(&l).and_then(|form| eval(&form, env.clone())) {
             Ok(data) => data,
             Err(err) => {
                 eprintln!("{}", err);
@@ -401,7 +483,7 @@ impl std::fmt::Display for Data {
             Unquote(x) => write!(f, "(unquote {})", x)?,
             SpliceUnqute(x) => write!(f, "(splice-unqute {})", x)?,
 
-            Fn(_) => write!(f, "<function>")?,
+            Fn(_) => write!(f, "#<function>")?,
         }
 
         Ok(())
