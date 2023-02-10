@@ -161,7 +161,7 @@ where
     let mut list = vec![];
 
     while let Some(token) = tokens.peek() {
-        if token.chars().next() == Some(close) {
+        if token.starts_with(close) {
             let _ = tokens.next();
             return Ok((
                 tokens,

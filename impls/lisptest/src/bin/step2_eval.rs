@@ -85,6 +85,7 @@ impl LispFn for LispDiv {
         Ok(Data::I64(n))
     }
 }
+
 struct Env {
     envmap: HashMap<String, Data>,
 }
@@ -112,10 +113,11 @@ fn eval<'env>(form: &'env Data, env: &'env Env) -> Result<Data> {
     use Data::*;
 
     Ok(match form {
-        Sym(s) => env.lookup(s)?.clone(),
-        List { pair: _, elements } => {
+        Var(s) => env.lookup(s)?.clone(),
+        List(elements) => {
+            // A empty list.
             if elements.is_empty() {
-                anyhow::bail!("call empty list")
+                return Ok(form.clone());
             }
 
             let func = eval(&elements[0], env)?;
@@ -130,6 +132,18 @@ fn eval<'env>(form: &'env Data, env: &'env Env) -> Result<Data> {
                 _ => anyhow::bail!("first argument of function call is not function: {}", func),
             }
         }
+        Ary(elements) => Data::Ary(
+            elements
+                .iter()
+                .map(|x| eval(x, env))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Map(elements) => Data::Map(
+            elements
+                .iter()
+                .map(|x| eval(x, env))
+                .collect::<Result<Vec<_>>>()?,
+        ),
         _ => form.clone(),
     })
 }
@@ -197,12 +211,17 @@ enum Data {
     Bool(bool),
     Str(String),
     I64(i64),
+    Var(String),
     Sym(String),
 
-    List {
-        pair: (char, char),
-        elements: Vec<Data>,
-    },
+    // (a b c)
+    List(Vec<Data>),
+
+    // [1 2 3]
+    Ary(Vec<Data>),
+
+    // {:one 1 :two 2}
+    Map(Vec<Data>),
 
     Quote(Box<Data>),
     QuasiQuote(Box<Data>),
@@ -223,18 +242,13 @@ impl PartialEq for Data {
             (Bool(lhs), Bool(rhs)) => lhs == rhs,
             (Str(lhs), Str(rhs)) => lhs == rhs,
             (I64(lhs), I64(rhs)) => lhs == rhs,
-            (Sym(lhs), Sym(rhs)) => lhs == rhs,
 
-            (
-                List {
-                    pair: lhs_pair,
-                    elements: lhs_elements,
-                },
-                List {
-                    pair: rhs_pair,
-                    elements: rhs_elements,
-                },
-            ) => lhs_pair == rhs_pair && lhs_elements == rhs_elements,
+            (Sym(lhs), Sym(rhs)) => lhs == rhs,
+            (Var(lhs), Var(rhs)) => lhs == rhs,
+
+            (List(lhs), List(rhs)) => lhs == rhs,
+            (Ary(lhs), Ary(rhs)) => lhs == rhs,
+            (Map(lhs), Map(rhs)) => lhs == rhs,
 
             (Quote(lhs), Quote(rhs)) => lhs == rhs,
             (QuasiQuote(lhs), QuasiQuote(rhs)) => lhs == rhs,
@@ -253,6 +267,31 @@ impl std::fmt::Debug for Data {
     }
 }
 
+fn fmt_list<T>(
+    (open, close): (char, char),
+    l: &[T],
+    f: &mut std::fmt::Formatter<'_>,
+) -> Result<(), std::fmt::Error>
+where
+    T: std::fmt::Display,
+{
+    write!(f, "{}", open)?;
+
+    let mut first = true;
+    for each in l {
+        if first {
+            first = false;
+        } else {
+            write!(f, " ")?;
+        }
+
+        write!(f, "{}", each)?;
+    }
+
+    write!(f, "{}", close)?;
+    Ok(())
+}
+
 impl std::fmt::Display for Data {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         use Data::*;
@@ -261,29 +300,14 @@ impl std::fmt::Display for Data {
             Nil => write!(f, "nil")?,
             Bool(b) => write!(f, "{}", b)?,
 
-            List {
-                pair: (open, close),
-                elements: l,
-            } => {
-                write!(f, "{}", open)?;
-
-                let mut first = true;
-                for each in l {
-                    if first {
-                        first = false;
-                    } else {
-                        write!(f, " ")?;
-                    }
-
-                    write!(f, "{}", each)?;
-                }
-
-                write!(f, "{}", close)?;
-            }
+            List(elements) => fmt_list(('(', ')'), elements, f)?,
+            Ary(elements) => fmt_list(('[', ']'), elements, f)?,
+            Map(elements) => fmt_list(('{', '}'), elements, f)?,
 
             Str(s) => write!(f, "{:?}", s)?,
             I64(n) => write!(f, "{}", n)?,
             Sym(s) => write!(f, "{}", s)?,
+            Var(s) => write!(f, "{}", s)?,
 
             Quote(x) => write!(f, "(quote {})", x)?,
             QuasiQuote(x) => write!(f, "(quasiquote {})", x)?,
@@ -304,44 +328,60 @@ fn test_read_form() {
     assert_eq!(
         read_str(r#"(define a (false nil "ok" false))"#).unwrap(),
         List(vec![
-            Sym("define".to_string()),
-            Sym("a".to_string()),
+            Var("define".to_string()),
+            Var("a".to_string()),
             List(vec![Bool(false), Nil, Str("ok".to_string()), Bool(false)]),
         ])
     );
 }
 
-fn read_list<'s, I>(mut tokens: std::iter::Peekable<I>) -> Result<(std::iter::Peekable<I>, Data)>
+fn read_list<'s, I>(tokens: std::iter::Peekable<I>) -> Result<(std::iter::Peekable<I>, Data)>
 where
     I: std::iter::Iterator<Item = &'s String>,
 {
-    let open = tokens.next().unwrap().chars().next().unwrap();
+    read_sequence(('(', ')'), tokens, Data::List)
+}
 
-    let close = match open {
-        '(' => ')',
-        '[' => ']',
-        '{' => '}',
-        token => panic!("invalid token: {:?}", token),
-    };
+fn read_ary<'s, I>(tokens: std::iter::Peekable<I>) -> Result<(std::iter::Peekable<I>, Data)>
+where
+    I: std::iter::Iterator<Item = &'s String>,
+{
+    read_sequence(('[', ']'), tokens, Data::Ary)
+}
+
+fn read_map<'s, I>(tokens: std::iter::Peekable<I>) -> Result<(std::iter::Peekable<I>, Data)>
+where
+    I: std::iter::Iterator<Item = &'s String>,
+{
+    read_sequence(('{', '}'), tokens, Data::Map)
+}
+
+fn read_sequence<'s, I, MakeSeq>(
+    (open, close): (char, char),
+    mut tokens: std::iter::Peekable<I>,
+    make_seq: MakeSeq,
+) -> Result<(std::iter::Peekable<I>, Data)>
+where
+    I: std::iter::Iterator<Item = &'s String>,
+    MakeSeq: Fn(Vec<Data>) -> Data,
+{
+    let _ = tokens.next(); // 跳过 open
 
     let mut list = vec![];
 
     while let Some(token) = tokens.peek() {
         if token.starts_with(close) {
             let _ = tokens.next();
-            return Ok((
-                tokens,
-                Data::List {
-                    pair: (open, close),
-                    elements: list,
-                },
-            ));
+            return Ok((tokens, make_seq(list)));
         }
 
+        // 从当前剩余的 tokens 读取一个 form，作为 list 的一项。
         let (rest_token, data) = read_form(tokens)?;
 
+        // 读取到的项目添加到容器里。
         list.push(data);
 
+        // 下一个循环解析剩下的 tokens。
         tokens = rest_token;
     }
 
@@ -395,11 +435,14 @@ where
         "nil" => Data::Nil,
 
         token if token.starts_with('"') => Data::Str(escape_str(token)?),
+
+        token if token.starts_with(':') => Data::Sym(token.to_string()),
+
         token => {
             if let Ok(n) = token.parse::<i64>() {
                 Data::I64(n)
             } else {
-                Data::Sym(token.to_string())
+                Data::Var(token.to_string())
             }
         }
     };
@@ -417,8 +460,12 @@ where
 {
     let token = tokens.peek().unwrap();
 
+    debug!("read form: {:?}", token);
+
     match token.as_str() {
-        "(" | "[" | "{" => read_list(tokens),
+        "(" => read_list(tokens),
+        "[" => read_ary(tokens),
+        "{" => read_map(tokens),
 
         "'" => {
             let _ = tokens.next();
