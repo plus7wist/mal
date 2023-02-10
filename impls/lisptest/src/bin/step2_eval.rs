@@ -1,11 +1,14 @@
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use lazy_static::lazy_static;
 
 use regex::Regex;
+
+use std::collections::HashMap;
+use std::rc::Rc;
 
 #[macro_use]
 extern crate log;
@@ -17,10 +20,126 @@ enum Token {
 }
 */
 
+trait LispFn {
+    fn apply(&self, args: &[Data]) -> Result<Data>;
+}
+
+struct LispAdd;
+
+impl LispFn for LispAdd {
+    fn apply(&self, args: &[Data]) -> Result<Data> {
+        let mut n = 0;
+        for each in args {
+            let x = match each {
+                Data::I64(n) => n,
+                _ => anyhow::bail!("can not call '+' on: {each}"),
+            };
+            n += x;
+        }
+
+        Ok(Data::I64(n))
+    }
+}
+
+struct LispMul;
+
+impl LispFn for LispMul {
+    fn apply(&self, args: &[Data]) -> Result<Data> {
+        let mut n = 1;
+
+        for each in args {
+            let x = match each {
+                Data::I64(n) => n,
+                _ => anyhow::bail!("can not call '*' on: {each}"),
+            };
+            n *= x;
+        }
+
+        Ok(Data::I64(n))
+    }
+}
+
+struct LispSub;
+
+impl LispFn for LispSub {
+    fn apply(&self, args: &[Data]) -> Result<Data> {
+        let n = match args {
+            [Data::I64(n)] => -n,
+            [Data::I64(lhs), Data::I64(rhs)] => lhs - rhs,
+            _ => anyhow::bail!("can not call '-' on arguments: {args:?}"),
+        };
+
+        Ok(Data::I64(n))
+    }
+}
+
+struct LispDiv;
+
+impl LispFn for LispDiv {
+    fn apply(&self, args: &[Data]) -> Result<Data> {
+        let n = match args {
+            [Data::I64(lhs), Data::I64(rhs)] => lhs / rhs,
+            _ => anyhow::bail!("can not call '/' on arguments: {args:?}"),
+        };
+
+        Ok(Data::I64(n))
+    }
+}
+struct Env {
+    envmap: HashMap<String, Data>,
+}
+
+impl Env {
+    fn new() -> Self {
+        let mut envmap: HashMap<String, _> = HashMap::new();
+
+        envmap.insert("+".to_string(), Data::Fn(Rc::new(LispAdd)));
+        envmap.insert("*".to_string(), Data::Fn(Rc::new(LispMul)));
+        envmap.insert("-".to_string(), Data::Fn(Rc::new(LispSub)));
+        envmap.insert("/".to_string(), Data::Fn(Rc::new(LispDiv)));
+
+        Self { envmap }
+    }
+
+    fn lookup(&self, name: &str) -> Result<&Data> {
+        self.envmap
+            .get(name)
+            .ok_or_else(|| anyhow::format_err!("failed to lookup: {}", name))
+    }
+}
+
+fn eval<'env>(form: &'env Data, env: &'env Env) -> Result<Data> {
+    use Data::*;
+
+    Ok(match form {
+        Sym(s) => env.lookup(s)?.clone(),
+        List { pair: _, elements } => {
+            if elements.is_empty() {
+                anyhow::bail!("call empty list")
+            }
+
+            let func = eval(&elements[0], env)?;
+            let args: Vec<_> = elements
+                .iter()
+                .skip(1)
+                .map(|x| eval(x, env))
+                .collect::<Result<Vec<_>>>()?;
+
+            match func {
+                Fn(func) => func.apply(&args)?,
+                _ => anyhow::bail!("first argument of function call is not function: {}", func),
+            }
+        }
+        _ => form.clone(),
+    })
+}
+
 fn main() -> Result<()> {
     env_logger::init();
 
     let mut ed = Editor::<()>::new()?;
+
+    let env = Env::new();
 
     loop {
         let l = match ed.readline("user> ") {
@@ -37,7 +156,7 @@ fn main() -> Result<()> {
             continue;
         }
 
-        let data = match read_str(&l) {
+        let data = match read_str(&l).and_then(|form| eval(&form, &env)) {
             Ok(data) => data,
             Err(err) => {
                 eprintln!("{}", err);
@@ -72,21 +191,66 @@ fn tokenize(text: &str) -> Vec<String> {
     RE.captures_iter(text).map(|x| x[1].to_string()).collect()
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone)]
 enum Data {
     Nil,
     Bool(bool),
+    Str(String),
+    I64(i64),
+    Sym(String),
+
     List {
         pair: (char, char),
         elements: Vec<Data>,
     },
-    Str(String),
-    I64(i64),
-    Sym(String),
+
     Quote(Box<Data>),
     QuasiQuote(Box<Data>),
     Unquote(Box<Data>),
     SpliceUnqute(Box<Data>),
+
+    Fn(Rc<dyn LispFn>),
+}
+
+impl Eq for Data {}
+
+impl PartialEq for Data {
+    fn eq(&self, rhs: &Data) -> bool {
+        use Data::*;
+
+        match (&self, rhs) {
+            (Nil, Nil) => true,
+            (Bool(lhs), Bool(rhs)) => lhs == rhs,
+            (Str(lhs), Str(rhs)) => lhs == rhs,
+            (I64(lhs), I64(rhs)) => lhs == rhs,
+            (Sym(lhs), Sym(rhs)) => lhs == rhs,
+
+            (
+                List {
+                    pair: lhs_pair,
+                    elements: lhs_elements,
+                },
+                List {
+                    pair: rhs_pair,
+                    elements: rhs_elements,
+                },
+            ) => lhs_pair == rhs_pair && lhs_elements == rhs_elements,
+
+            (Quote(lhs), Quote(rhs)) => lhs == rhs,
+            (QuasiQuote(lhs), QuasiQuote(rhs)) => lhs == rhs,
+            (SpliceUnqute(lhs), SpliceUnqute(rhs)) => lhs == rhs,
+
+            (Fn(_), Fn(_)) => false,
+
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Data {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        <Data as std::fmt::Display>::fmt(self, f)
+    }
 }
 
 impl std::fmt::Display for Data {
@@ -125,6 +289,8 @@ impl std::fmt::Display for Data {
             QuasiQuote(x) => write!(f, "(quasiquote {})", x)?,
             Unquote(x) => write!(f, "(unquote {})", x)?,
             SpliceUnqute(x) => write!(f, "(splice-unqute {})", x)?,
+
+            Fn(_) => write!(f, "<function>")?,
         }
 
         Ok(())
@@ -161,7 +327,7 @@ where
     let mut list = vec![];
 
     while let Some(token) = tokens.peek() {
-        if token.chars().next() == Some(close) {
+        if token.starts_with(close) {
             let _ = tokens.next();
             return Ok((
                 tokens,
